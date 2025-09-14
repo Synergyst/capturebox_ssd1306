@@ -1,18 +1,39 @@
+// ssd1306_bin.c
+// SSD1306 OLED utility with power meter, video monitor, and GPS/NMEA time/lat/lon fields.
+//
+// New features:
+// -E list adds: utc_time, utc_date, local_time, local_date, lat, lon
+// -p dev[,baud[,timeout]]: NMEA serial (default /dev/ttyS0,115200,10)
+// -Z TZ: timezone for local time (IANA or POSIX, e.g., CST6CDT) requires -DNMEA_MINI_ENABLE_TZ
+//
+// Build (UTC-only):
+//   gcc -std=c11 -O2 -Wall -Wextra -o ssd1306_bin ssd1306_bin.c nmea_miniparser.c -lm
+// Build (with local time formatting helpers in header):
+//   gcc -std=c11 -O2 -Wall -Wextra -DNMEA_MINI_ENABLE_TZ -o ssd1306_bin ssd1306_bin.c nmea_miniparser.c -lm
+
 #include <linux/i2c-dev.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <inttypes.h>
 #include <unistd.h>
 #include <stdio.h>
+#include <unistd.h>
 #include <string.h>
 #include <strings.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <signal.h>
 #include <time.h>
+#include <termios.h>
+#include <sys/select.h>
+#include <sys/time.h>
+#include <time.h>
+#include <popt.h>
+
 #include "ssd1306.h"
 #include "linux_i2c.h"
 #include "image.h"
+#include "nmea_miniparser.h"
 
 // Persistent resolution file used by the library
 static const char* RES_FILE = "/tmp/.ssd1306_oled_type";
@@ -50,7 +71,7 @@ static void print_help() {
   printf("-B <bus>   INA219 I2C bus number (default 10)\n");
   printf("-G <addr>  INA219 I2C address (hex 0x43 or decimal, default 0x43)\n");
   printf("-U <ms>    INA219 sample/update period in ms (default 2000 ms)\n");
-  printf("-E <list>  enable fields: comma list of psu,load,curr,power,pct,vid,fmt or 'none' (default all)\n");
+  printf("-E <list>  enable fields: comma list of psu,load,curr,power,pct,vid,fmt,utc_time,utc_date,local_time,local_date,lat,lon or 'none' (default all)\n");
   printf("-b         show battery icon on bottom row (independent of -E)\n");
   printf("-C <name>  charge icon style: plug|plus|check|bolt_h (default plug)\n");
   printf("-F         flash between fill-only and icon overlay (half period each)\n");
@@ -61,6 +82,8 @@ static void print_help() {
   printf("-V <list>  video devices to check (comma list), default /dev/video0\n");
   printf("-Q <ms>    video poll interval (default 2000 ms)\n");
   printf("-j <px>    video icon X offset in pixels (default 0)\n");
+  printf("-p <spec>  NMEA serial spec: dev[,baud[,timeout]] (default /dev/ttyS0,115200,10)\n");
+  printf("-Z <TZ>    Timezone for local time (IANA or POSIX, needs -DNMEA_MINI_ENABLE_TZ)\n");
   printf("-h         this help\n");
 }
 
@@ -353,38 +376,53 @@ static void meter_diff_and_draw(uint8_t row_page, int x_chars, char* prev, const
 }
 
 // ---------------- Dynamic fields and battery + video icons ----------------
-// Field mask bits
-#define FLD_PSU    (1u << 0)
-#define FLD_LOAD   (1u << 1)
-#define FLD_CURR   (1u << 2)
-#define FLD_POWER  (1u << 3)
-#define FLD_PCT    (1u << 4)
-#define FLD_NONE   (1u << 5)
-#define FLD_VID    (1u << 6)
-#define FLD_FMT    (1u << 7)
 
-static inline uint8_t default_field_mask(void) {
+// Field mask bits (now 32-bit to allow new GPS/time fields)
+typedef uint32_t field_mask_t;
+#define FLD_PSU        (1u << 0)
+#define FLD_LOAD       (1u << 1)
+#define FLD_CURR       (1u << 2)
+#define FLD_POWER      (1u << 3)
+#define FLD_PCT        (1u << 4)
+#define FLD_NONE       (1u << 5)
+#define FLD_VID        (1u << 6)
+#define FLD_FMT        (1u << 7)
+// New GPS/time fields
+#define FLD_UTC_TIME   (1u << 8)
+#define FLD_UTC_DATE   (1u << 9)
+#define FLD_LOCAL_TIME (1u << 10)
+#define FLD_LOCAL_DATE (1u << 11)
+#define FLD_LAT        (1u << 12)
+#define FLD_LON        (1u << 13)
+
+static inline field_mask_t default_field_mask(void) {
   return (FLD_PSU | FLD_LOAD | FLD_CURR | FLD_POWER | FLD_PCT | FLD_VID | FLD_FMT);
 }
 
-static uint8_t parse_enabled_fields(const char* s) {
+static field_mask_t parse_enabled_fields(const char* s) {
   if (!s || !*s) return default_field_mask();
-  uint8_t mask = 0;
+  field_mask_t mask = 0;
   int saw_none = 0;
-  char buf[128];
+  char buf[256];
   strncpy(buf, s, sizeof(buf) - 1);
   buf[sizeof(buf) - 1] = '\0';
   char* tok = strtok(buf, ",");
   while (tok) {
     while (*tok == ' ' || *tok == '\t') tok++;
     if (!strcasecmp(tok, "none")) { saw_none = 1; mask = FLD_NONE; break; }
-    if (!strcasecmp(tok, "psu"))   mask |= FLD_PSU;
-    else if (!strcasecmp(tok, "load"))  mask |= FLD_LOAD;
-    else if (!strcasecmp(tok, "curr"))  mask |= FLD_CURR;
-    else if (!strcasecmp(tok, "power")) mask |= FLD_POWER;
-    else if (!strcasecmp(tok, "pct"))   mask |= FLD_PCT;
-    else if (!strcasecmp(tok, "vid"))   mask |= FLD_VID;
-    else if (!strcasecmp(tok, "fmt"))   mask |= FLD_FMT;
+    if (!strcasecmp(tok, "psu"))         mask |= FLD_PSU;
+    else if (!strcasecmp(tok, "load"))   mask |= FLD_LOAD;
+    else if (!strcasecmp(tok, "curr"))   mask |= FLD_CURR;
+    else if (!strcasecmp(tok, "power"))  mask |= FLD_POWER;
+    else if (!strcasecmp(tok, "pct"))    mask |= FLD_PCT;
+    else if (!strcasecmp(tok, "vid"))    mask |= FLD_VID;
+    else if (!strcasecmp(tok, "fmt"))    mask |= FLD_FMT;
+    else if (!strcasecmp(tok, "utc_time") || !strcasecmp(tok, "utc"))    mask |= FLD_UTC_TIME;
+    else if (!strcasecmp(tok, "utc_date"))                                mask |= FLD_UTC_DATE;
+    else if (!strcasecmp(tok, "local_time") || !strcasecmp(tok, "tz"))   mask |= FLD_LOCAL_TIME;
+    else if (!strcasecmp(tok, "local_date") || !strcasecmp(tok, "date")) mask |= FLD_LOCAL_DATE;
+    else if (!strcasecmp(tok, "lat"))                                     mask |= FLD_LAT;
+    else if (!strcasecmp(tok, "lon"))                                     mask |= FLD_LON;
     tok = strtok(NULL, ",");
   }
   if (saw_none) return FLD_NONE;
@@ -430,20 +468,38 @@ static void build_video_list(const char* list, video_list_t* out) {
   }
 }
 
-static void meter_draw_static_labels_dyn_for_vlist(const video_list_t* vlist, uint8_t enabled_mask, uint8_t max_rows) {
+static void meter_draw_static_labels_dyn_for_vlist(const video_list_t* vlist,
+                                                   field_mask_t enabled_mask,
+                                                   uint8_t max_rows,
+                                                   const char* tz_label_opt) {
   if (!(enabled_mask & FLD_NONE)) {
     const char* lab_psu   = "SUPP(V):";
     const char* lab_load  = "LOAD(V):";
     const char* lab_curr  = "CUR(mA):";
     const char* lab_power = "POWR(W):";
     const char* lab_pct   = "BATT(%):";
-    uint8_t row = 0;
-    if ((enabled_mask & FLD_PSU)   && row < max_rows) { ssd1306_oled_set_XY(0, row); ssd1306_oled_write_line(METER_FONT_SIZE, (char*)lab_psu);   row++; }
-    if ((enabled_mask & FLD_LOAD)  && row < max_rows) { ssd1306_oled_set_XY(0, row); ssd1306_oled_write_line(METER_FONT_SIZE, (char*)lab_load);  row++; }
-    if ((enabled_mask & FLD_CURR)  && row < max_rows) { ssd1306_oled_set_XY(0, row); ssd1306_oled_write_line(METER_FONT_SIZE, (char*)lab_curr);  row++; }
-    if ((enabled_mask & FLD_POWER) && row < max_rows) { ssd1306_oled_set_XY(0, row); ssd1306_oled_write_line(METER_FONT_SIZE, (char*)lab_power); row++; }
+    const char* lab_utc   = "UTC:";
+    char lab_local[16]; lab_local[0] = 0;
 
-    // VID / FMT handling: if vlist has multiple devices, create VID0:, FMT0:, VID1:, FMT1: etc.
+    if (tz_label_opt && *tz_label_opt) {
+      snprintf(lab_local, sizeof(lab_local), "%.12s:", tz_label_opt);
+    } else {
+      snprintf(lab_local, sizeof(lab_local), "LOCAL:");
+    }
+
+    uint8_t row = 0;
+    if ((enabled_mask & FLD_PSU)        && row < max_rows) { ssd1306_oled_set_XY(0, row); ssd1306_oled_write_line(METER_FONT_SIZE, (char*)lab_psu);   row++; }
+    if ((enabled_mask & FLD_LOAD)       && row < max_rows) { ssd1306_oled_set_XY(0, row); ssd1306_oled_write_line(METER_FONT_SIZE, (char*)lab_load);  row++; }
+    if ((enabled_mask & FLD_CURR)       && row < max_rows) { ssd1306_oled_set_XY(0, row); ssd1306_oled_write_line(METER_FONT_SIZE, (char*)lab_curr);  row++; }
+    if ((enabled_mask & FLD_POWER)      && row < max_rows) { ssd1306_oled_set_XY(0, row); ssd1306_oled_write_line(METER_FONT_SIZE, (char*)lab_power); row++; }
+
+    if ((enabled_mask & FLD_UTC_TIME)   && row < max_rows) { ssd1306_oled_set_XY(0, row); ssd1306_oled_write_line(METER_FONT_SIZE, (char*)lab_utc);   row++; }
+    if ((enabled_mask & FLD_LOCAL_TIME) && row < max_rows) { ssd1306_oled_set_XY(0, row); ssd1306_oled_write_line(METER_FONT_SIZE, (lab_local[0]?lab_local:(char*)"LOCAL:")); row++; }
+    if ((enabled_mask & FLD_UTC_DATE)   && row < max_rows) { ssd1306_oled_set_XY(0, row); ssd1306_oled_write_line(METER_FONT_SIZE, (char*)"UDATE:");  row++; }
+    if ((enabled_mask & FLD_LOCAL_DATE) && row < max_rows) { ssd1306_oled_set_XY(0, row); ssd1306_oled_write_line(METER_FONT_SIZE, (char*)"LDATE:");  row++; }
+    if ((enabled_mask & FLD_LAT)        && row < max_rows) { ssd1306_oled_set_XY(0, row); ssd1306_oled_write_line(METER_FONT_SIZE, (char*)"LAT:");    row++; }
+    if ((enabled_mask & FLD_LON)        && row < max_rows) { ssd1306_oled_set_XY(0, row); ssd1306_oled_write_line(METER_FONT_SIZE, (char*)"LON:");    row++; }
+
     if (vlist && vlist->count > 1) {
       for (int i = 0; i < vlist->count && row < max_rows; ++i) {
         char lab[16];
@@ -458,12 +514,10 @@ static void meter_draw_static_labels_dyn_for_vlist(const video_list_t* vlist, ui
         row++;
       }
     } else {
-      // Single device or none: use legacy labels
-      if ((enabled_mask & FLD_VID) && row < max_rows) { ssd1306_oled_set_XY(0, row); ssd1306_oled_write_line(METER_FONT_SIZE, (char*)"VID:"); row++; }
-      if ((enabled_mask & FLD_FMT) && row < max_rows) { ssd1306_oled_set_XY(0, row); ssd1306_oled_write_line(METER_FONT_SIZE, (char*)"FMT:"); row++; }
+      if ((enabled_mask & FLD_VID)      && row < max_rows) { ssd1306_oled_set_XY(0, row); ssd1306_oled_write_line(METER_FONT_SIZE, (char*)"VID:");   row++; }
+      if ((enabled_mask & FLD_FMT)      && row < max_rows) { ssd1306_oled_set_XY(0, row); ssd1306_oled_write_line(METER_FONT_SIZE, (char*)"FMT:");   row++; }
     }
-
-    if ((enabled_mask & FLD_PCT)   && row < max_rows) { ssd1306_oled_set_XY(0, row); ssd1306_oled_write_line(METER_FONT_SIZE, (char*)lab_pct);   row++; }
+    if ((enabled_mask & FLD_PCT)        && row < max_rows) { ssd1306_oled_set_XY(0, row); ssd1306_oled_write_line(METER_FONT_SIZE, (char*)lab_pct);   row++; }
   }
 }
 
@@ -476,13 +530,22 @@ typedef struct {
   // keep single vid/fmt for single-device mode only
   char vid[24];
   char fmt[24];
+
+  // GPS/time
+  char utc_time[24];
+  char utc_date[24];
+  char local_time[24];
+  char local_date[24];
+  char lat[24];
+  char lon[24];
+
   int  initialized;
 } meter_prev_t;
 
-// updated to support multi-device VID/FMT expansion
+// updated to support new GPS/time and multi-device VID/FMT expansion
 static uint8_t meter_update_values_dyn(meter_prev_t* st,
                                        const video_list_t* vlist,
-                                       uint8_t enabled_mask,
+                                       field_mask_t enabled_mask,
                                        uint8_t max_rows,
                                        int start_chars,
                                        double busV, double shuntV,
@@ -490,7 +553,14 @@ static uint8_t meter_update_values_dyn(meter_prev_t* st,
                                        double percent,
                                        const char vid_texts[][24],
                                        const char fmt_texts[][24],
-                                       int vid_count) {
+                                       int vid_count,
+                                       const char* utc_time,
+                                       const char* utc_date,
+                                       const char* local_time,
+                                       const char* local_date,
+                                       const char* lat_str,
+                                       const char* lon_str,
+                                       const char* tz_label_opt) {
   if (!st) return 0;
   char now_psu[24], now_load[24], now_curr[24], now_power[24], now_pct[24];
   char now_vid[24], now_fmt[24];
@@ -502,50 +572,47 @@ static uint8_t meter_update_values_dyn(meter_prev_t* st,
   else                 snprintf(now_pct, sizeof(now_pct), "%3.2f", percent);
   snprintf(now_vid,   sizeof(now_vid),   "%s", (vid_count > 0 && vid_texts) ? vid_texts[0] : "");
   snprintf(now_fmt,   sizeof(now_fmt),   "%s", (vid_count > 0 && fmt_texts) ? fmt_texts[0] : "");
-
   if (!st->initialized) {
-    meter_draw_static_labels_dyn_for_vlist(vlist, enabled_mask, max_rows);
+    meter_draw_static_labels_dyn_for_vlist(vlist, enabled_mask, max_rows, tz_label_opt);
     st->psu[0] = st->load[0] = st->curr[0] = st->power[0] = st->pct[0] = st->vid[0] = st->fmt[0] = '\0';
+    st->utc_time[0] = st->utc_date[0] = st->local_time[0] = st->local_date[0] = st->lat[0] = st->lon[0] = '\0';
     st->initialized = 1;
   }
-
-  // Compute label lengths so VID/FMT values can be placed immediately after their labels
   const int vid_label_chars_single = (int)strlen("VID:"); // 4
   const int fmt_label_chars_single = (int)strlen("FMT:"); // 4
-
   uint8_t row = 0;
-  if ((enabled_mask & FLD_PSU)   && row < max_rows) { meter_diff_and_draw(row, start_chars, st->psu,   now_psu);   row++; }
-  if ((enabled_mask & FLD_LOAD)  && row < max_rows) { meter_diff_and_draw(row, start_chars, st->load,  now_load);  row++; }
-  if ((enabled_mask & FLD_CURR)  && row < max_rows) { meter_diff_and_draw(row, start_chars, st->curr,  now_curr);  row++; }
-  if ((enabled_mask & FLD_POWER) && row < max_rows) { meter_diff_and_draw(row, start_chars, st->power, now_power); row++; }
-
+  if ((enabled_mask & FLD_PSU)        && row < max_rows) { meter_diff_and_draw(row, start_chars, st->psu,       now_psu);   row++; }
+  if ((enabled_mask & FLD_LOAD)       && row < max_rows) { meter_diff_and_draw(row, start_chars, st->load,      now_load);  row++; }
+  if ((enabled_mask & FLD_CURR)       && row < max_rows) { meter_diff_and_draw(row, start_chars, st->curr,      now_curr);  row++; }
+  if ((enabled_mask & FLD_POWER)      && row < max_rows) { meter_diff_and_draw(row, start_chars, st->power,     now_power); row++; }
+  // GPS/time
+  if ((enabled_mask & FLD_UTC_TIME)   && row < max_rows) { meter_diff_and_draw(row, start_chars, st->utc_time,   utc_time ? utc_time : "");     row++; }
+  if ((enabled_mask & FLD_LOCAL_TIME) && row < max_rows) { meter_diff_and_draw(row, start_chars, st->local_time, local_time ? local_time : ""); row++; }
+  if ((enabled_mask & FLD_UTC_DATE)   && row < max_rows) { meter_diff_and_draw(row, start_chars, st->utc_date,   utc_date ? utc_date : "");     row++; }
+  if ((enabled_mask & FLD_LOCAL_DATE) && row < max_rows) { meter_diff_and_draw(row, start_chars, st->local_date, local_date ? local_date : ""); row++; }
+  if ((enabled_mask & FLD_LAT)        && row < max_rows) { meter_diff_and_draw(row, start_chars, st->lat,       lat_str ? lat_str : "");       row++; }
+  if ((enabled_mask & FLD_LON)        && row < max_rows) { meter_diff_and_draw(row, start_chars, st->lon,       lon_str ? lon_str : "");       row++; }
   // For VID/FMT:
   if (vlist && vlist->count > 1) {
     // Multi-device: expand VIDn/FMTn pairs into rows
     for (int i = 0; i < vid_count && row < max_rows; ++i) {
-      // VIDi: -> write value immediately after "VIDn:" label, which is 5 chars (e.g., "VID0:")
-      char val[24];
-      snprintf(val, sizeof(val), "%s", vid_texts[i]);
+      // VIDi value
       int label_chars = (int)strlen("VID0:"); // 5
-      // set position and write (clear first to avoid remnants)
-      //ssd1306_oled_clear_line(row);
       ssd1306_oled_set_XY((uint8_t)(label_chars * meter_char_width()), row);
-      ssd1306_oled_write_line(METER_FONT_SIZE, val);
+      ssd1306_oled_write_line(METER_FONT_SIZE, vid_texts[i]);
       row++;
       if (row >= max_rows) break;
-      // FMTi:
-      //ssd1306_oled_clear_line(row);
+      // FMTi value
       ssd1306_oled_set_XY((uint8_t)(label_chars * meter_char_width()), row);
       ssd1306_oled_write_line(METER_FONT_SIZE, fmt_texts[i]);
       row++;
     }
   } else {
     // Single device: behave like original code for VID/FMT
-    if ((enabled_mask & FLD_VID)   && row < max_rows) { meter_diff_and_draw(row, vid_label_chars_single, st->vid,   now_vid);   row++; }
-    if ((enabled_mask & FLD_FMT)   && row < max_rows) { meter_diff_and_draw(row, fmt_label_chars_single, st->fmt,   now_fmt);   row++; }
+    if ((enabled_mask & FLD_VID)      && row < max_rows) { meter_diff_and_draw(row, vid_label_chars_single, st->vid, now_vid); row++; }
+    if ((enabled_mask & FLD_FMT)      && row < max_rows) { meter_diff_and_draw(row, fmt_label_chars_single, st->fmt, now_fmt); row++; }
   }
-
-  if ((enabled_mask & FLD_PCT)   && row < max_rows) { meter_diff_and_draw(row, start_chars, st->pct,   now_pct);   row++; }
+  if ((enabled_mask & FLD_PCT)        && row < max_rows) { meter_diff_and_draw(row, start_chars, st->pct, now_pct); row++; }
   return row;
 }
 
@@ -800,16 +867,15 @@ static video_state_t parse_video_status_for_dev(const char* devnode, char* fmt_o
   while (fgets(line, sizeof(line), fp)) {
     if (strstr(line, "No video detected")) {
       st = VID_ABSENT;
-      memcpy(fmt_out, "No HDMI signal", 14);
-      fmt_out[14] = '\0';
-      //fprintf(stderr, "%s\n", fmt_out);
+      if (fmt_out && fmt_len) {
+        snprintf(fmt_out, fmt_len, "No HDMI signal");
+      }
     }
     if (strstr(line, "Detected format:")) {
       st = VID_PRESENT;
       char* p = strstr(line, "Detected format:");
       p += strlen("Detected format:");
       while (*p == ' ' || *p == '\t') p++;
-      //size_t n = strcspn(p, "\r\n");
       size_t n = strcspn(p, " (");
       if (fmt_out && fmt_len) {
         if (n >= fmt_len) n = fmt_len - 1;
@@ -852,7 +918,6 @@ static video_state_t parse_video_status_multi(const char* list, char* fmt_out, s
       // keep scanning to update 'agg' but we already have one present
     } else if (st == VID_UNKNOWN && agg == VID_ABSENT) {
       agg = VID_UNKNOWN;
-      // We should print at least no-signal, this code is likely redundant long-term...
       if (fmt_out && fmt_len && fmt_out[0] == '\0') {
         snprintf(fmt_out, fmt_len, "%s", fmt_local);
       }
@@ -890,9 +955,7 @@ static void draw_video_icon_box(uint8_t last_page, int x_px, int is_ok) {
   } else {
     // an 'X' inside
     for (int i = 2; i <= 5; ++i) {
-      //int x1 = 2 + (i - 2);
       int x1 = 4 + (i - 2);
-      //int x2 = (VICON_W - 3) - (i - 2);
       int x2 = (VICON_W - 3) - i;
       cols[x1] |= (1u << i);
       cols[x2] |= (1u << i);
@@ -915,13 +978,166 @@ static void video_box_update(vid_box_state_t* st, uint8_t last_page, int x_px, v
   }
 }
 
-// ---------------- Power meter loop with video overlays ----------------
+// ---------------- GPS/NMEA helpers ----------------
+typedef struct {
+  int fd;
+  int baud;
+  char dev[128];
+  int initialized;
+  int verbosity;
+  nmea_info_t info;
+  nmea_acc_t acc;
+  // formatted outputs
+  char utc_date[32];
+  char utc_time[32];
+  char local_date[32];
+  char local_time[32];
+  char local_dt[64];
+  int  have_local;
+  double lat;
+  double lon;
+  int has_any;
+} gps_state_t;
+
+static speed_t gps_baud_to_speed_t(unsigned long baud) {
+  switch (baud) {
+    case 0: return B0;
+    case 50: return B50;
+    case 75: return B75;
+    case 110: return B110;
+    case 134: return B134;
+    case 150: return B150;
+    case 200: return B200;
+    case 300: return B300;
+    case 600: return B600;
+    case 1200: return B1200;
+    case 1800: return B1800;
+    case 2400: return B2400;
+    case 4800: return B4800;
+    case 9600: return B9600;
+    case 19200: return B19200;
+    case 38400: return B38400;
+#ifdef B57600
+    case 57600: return B57600;
+#endif
+#ifdef B115200
+    case 115200: return B115200;
+#endif
+#ifdef B230400
+    case 230400: return B230400;
+#endif
+#ifdef B460800
+    case 460800: return B460800;
+#endif
+#ifdef B921600
+    case 921600: return B921600;
+#endif
+    default: return B115200;
+  }
+}
+
+static void gps_set_raw_termios(struct termios* tio) {
+  tio->c_iflag &= ~(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL | IXON);
+  tio->c_oflag &= ~OPOST;
+  tio->c_lflag &= ~(ECHO | ECHONL | ICANON | ISIG | IEXTEN);
+  tio->c_cflag &= ~(CSIZE | PARENB);
+  tio->c_cflag |= CS8;
+}
+
+static int gps_setup_serial(const char* dev, unsigned long baud) {
+  int fd = open(dev, O_RDONLY | O_NOCTTY | O_NONBLOCK);
+  if (fd < 0) return -1;
+  struct termios tio;
+  if (tcgetattr(fd, &tio) != 0) { close(fd); return -1; }
+  gps_set_raw_termios(&tio);
+  tio.c_cflag |= (CLOCAL | CREAD);
+#ifdef CRTSCTS
+  tio.c_cflag &= ~CRTSCTS;
+#endif
+  tio.c_iflag &= ~(IXON | IXOFF | IXANY);
+  tio.c_cc[VMIN]  = 0;
+  tio.c_cc[VTIME] = 0;
+  speed_t spd = gps_baud_to_speed_t(baud);
+  if (cfsetispeed(&tio, spd) != 0 || cfsetospeed(&tio, spd) != 0) { close(fd); return -1; }
+  if (tcsetattr(fd, TCSANOW, &tio) != 0) { close(fd); return -1; }
+  tcflush(fd, TCIFLUSH);
+  return fd;
+}
+
+static int gps_on_line_cb(const char* line, void* user) {
+  nmea_info_t* info = (nmea_info_t*)user;
+  (void)nmea_parse_line(line, info);
+  return 1;
+}
+
+static void gps_init(gps_state_t* gps, const char* dev, int baud) {
+  if (!gps) return;
+  memset(gps, 0, sizeof(*gps));
+  snprintf(gps->dev, sizeof(gps->dev), "%s", (dev && *dev) ? dev : "/dev/ttyS0");
+  gps->baud = (baud > 0) ? baud : 115200;
+  gps->fd = gps_setup_serial(gps->dev, (unsigned long)gps->baud);
+  nmea_info_clear(&gps->info);
+  nmea_acc_init(&gps->acc);
+  gps->initialized = (gps->fd >= 0) ? 1 : 0;
+}
+
+static void gps_close(gps_state_t* gps) {
+  if (gps && gps->fd >= 0) { close(gps->fd); gps->fd = -1; }
+}
+
+// Non-blocking poll: feed available bytes for up to poll_window_ms
+static void gps_poll(gps_state_t* gps, unsigned poll_window_ms, int verbose_echo) {
+  if (!gps || gps->fd < 0) return;
+  struct timeval t0, t;
+  gettimeofday(&t0, NULL);
+  for (;;) {
+    gettimeofday(&t, NULL);
+    unsigned elapsed = (unsigned)((t.tv_sec - t0.tv_sec) * 1000u + (t.tv_usec - t0.tv_usec) / 1000u);
+    if (elapsed >= (poll_window_ms ? poll_window_ms : 150u)) break;
+    struct timeval tv = { 0, 50000 }; // 50ms
+    fd_set rfds; FD_ZERO(&rfds); FD_SET(gps->fd, &rfds);
+    int sel = select(gps->fd + 1, &rfds, NULL, NULL, &tv);
+    if (sel <= 0) continue;
+    if (FD_ISSET(gps->fd, &rfds)) {
+      char buf[256];
+      ssize_t n = read(gps->fd, buf, sizeof(buf));
+      if (n > 0) {
+        nmea_acc_feed(&gps->acc, buf, (size_t)n, gps_on_line_cb, &gps->info, verbose_echo ? 1 : 0);
+      }
+    }
+  }
+}
+
+static void gps_format_outputs(gps_state_t* gps, const char* tz_opt) {
+  if (!gps) return;
+  gps->utc_date[0] = gps->utc_time[0] = 0;
+  gps->local_date[0] = gps->local_time[0] = gps->local_dt[0] = 0;
+  gps->have_local = 0;
+  if (gps->info.has_time || gps->info.has_date) {
+    nmea_format_utc(&gps->info, gps->utc_date, sizeof gps->utc_date, gps->utc_time, sizeof gps->utc_time);
+#if defined(NMEA_MINI_ENABLE_TZ)
+    if (tz_opt && *tz_opt && gps->info.has_time) {
+      gps->have_local = nmea_format_local_from_info(&gps->info, tz_opt,
+                                                    gps->local_date, sizeof gps->local_date,
+                                                    gps->local_time, sizeof gps->local_time,
+                                                    gps->local_dt, sizeof gps->local_dt);
+    }
+#else
+    (void)tz_opt;
+#endif
+  }
+  if (gps->info.has_lat) gps->lat = gps->info.lat;
+  if (gps->info.has_lon) gps->lon = gps->info.lon;
+  if (gps->info.has_time || gps->info.has_date || gps->info.has_lat || gps->info.has_lon) gps->has_any = 1;
+}
+
+// ---------------- Power meter loop with video overlays and GPS ----------------
 static void run_power_meter_loop(int bus,
                                  uint8_t addr,
                                  unsigned period_ms,
                                  int oled_cols,
                                  int oled_lines,
-                                 uint8_t fields_mask,
+                                 field_mask_t fields_mask,
                                  int show_batt_icon,
                                  int invert_charge,
                                  int batt_x_offset,
@@ -930,7 +1146,9 @@ static void run_power_meter_loop(int bus,
                                  ChargeIconStyle icon_style,
                                  const char* video_devs,
                                  unsigned video_poll_ms,
-                                 int vid_icon_x_offset) {
+                                 int vid_icon_x_offset,
+                                 const char* nmea_spec,
+                                 const char* tz_opt) {
   ina219_t meter;
   if (ina219_open(&meter, bus, addr) != 0) {
     fprintf(stderr, "INA219 open failed (bus %d addr 0x%02X)\n", bus, addr);
@@ -941,17 +1159,36 @@ static void run_power_meter_loop(int bus,
     ina219_close(&meter);
     return;
   }
+
+  // GPS/NMEA
+  int need_gps = (fields_mask & (FLD_UTC_TIME | FLD_UTC_DATE | FLD_LOCAL_TIME | FLD_LOCAL_DATE | FLD_LAT | FLD_LON)) ? 1 : 0;
+  gps_state_t gps; memset(&gps, 0, sizeof(gps));
+  char nmea_dev[128] = "/dev/ttyS0"; int nmea_baud = 115200; int nmea_timeout = 10;
+  if (need_gps) {
+    if (nmea_spec && *nmea_spec) {
+      // parse "dev[,baud[,timeout]]"
+      char tmp[192]; strncpy(tmp, nmea_spec, sizeof(tmp)-1); tmp[sizeof(tmp)-1] = '\0';
+      char* a = strtok(tmp, ",");
+      char* b = strtok(NULL, ",");
+      char* c = strtok(NULL, ",");
+      if (a && *a) snprintf(nmea_dev, sizeof(nmea_dev), "%s", a);
+      if (b) nmea_baud = atoi(b);
+      if (c) nmea_timeout = atoi(c); // reserved if needed later
+      (void)nmea_timeout;
+    }
+    gps_init(&gps, nmea_dev, nmea_baud);
+  }
+
   ssd1306_oled_set_mem_mode(SSD1306_PAGE_MODE);
   meter_prev_t prev = {0};
   batt_state_t bstate_fill = {0};
   batt_state_style_t bstate_icon = {0};
-
   uint8_t page_count = (uint8_t)(oled_lines / 8);
   if (page_count == 0) page_count = 1;
   uint8_t last_page = (uint8_t)(page_count - 1);
   uint8_t max_text_rows = show_batt_icon ? last_page : page_count;
-  const int start_chars = 8;
 
+  const int start_chars = 8;
   int icon_x = batt_x_offset;
   if (icon_x < 0) {
     icon_x = (oled_cols - batt_width_px) / 2;
@@ -978,7 +1215,7 @@ static void run_power_meter_loop(int bus,
     clock_gettime(CLOCK_MONOTONIC, &ts);
     unsigned now_ms = (unsigned)(ts.tv_sec * 1000u + ts.tv_nsec / 1000000u);
 
-    // Poll video status at requested interval
+    // Poll video status
     int do_video_poll = 0;
     if (last_video_poll_ms == 0 || (now_ms - last_video_poll_ms) >= (video_poll_ms ? video_poll_ms : 2000)) {
       do_video_poll = 1;
@@ -987,7 +1224,6 @@ static void run_power_meter_loop(int bus,
 
     static char agg_fmt_buf[64];
     static video_state_t agg_state = VID_UNKNOWN;
-
     if (do_video_poll) {
       agg_state = VID_ABSENT;
       agg_fmt_buf[0] = '\0';
@@ -1009,12 +1245,10 @@ static void run_power_meter_loop(int bus,
           }
         } else if (st == VID_ABSENT) {
           snprintf(vid_texts[i], sizeof(vid_texts[i]), "Cable undetected");
-          //fmt_texts[i][0] = '\0';
-          // We should print at least no-signal, this code is likely redundant long-term...
           snprintf(fmt_texts[i], sizeof(fmt_texts[i]), "%s", fmt_local);
           if (agg_state != VID_PRESENT) {
-            agg_state = VID_PRESENT;
-            snprintf(agg_fmt_buf, sizeof(agg_fmt_buf), "%s", fmt_local);
+            agg_state = VID_ABSENT;
+            if (agg_fmt_buf[0] == '\0') snprintf(agg_fmt_buf, sizeof(agg_fmt_buf), "%s", fmt_local);
           }
         } else {
           snprintf(vid_texts[i], sizeof(vid_texts[i]), "UNK");
@@ -1033,11 +1267,34 @@ static void run_power_meter_loop(int bus,
     if (percent > 100.0) percent = 100.0;
     if (percent < 0.0)   percent = 0.0;
 
+    // Poll GPS if requested
+    char gps_utc_time[24] = ""; char gps_utc_date[24] = "";
+    char gps_local_time[24] = ""; char gps_local_date[24] = "";
+    char gps_lat[24] = ""; char gps_lon[24] = "";
+    if (need_gps && gps.initialized) {
+      gps_poll(&gps, 150, 0);
+      gps_format_outputs(&gps, (tz_opt && *tz_opt) ? tz_opt : NULL);
+      if (gps.info.has_time) {
+        snprintf(gps_utc_time, sizeof(gps_utc_time), "%s", gps.utc_time[0] ? gps.utc_time : "");
+        if (gps.have_local && gps.local_time[0]) snprintf(gps_local_time, sizeof(gps_local_time), "%s", gps.local_time);
+      }
+      if (gps.info.has_date) {
+        snprintf(gps_utc_date, sizeof(gps_utc_date), "%s", gps.utc_date[0] ? gps.utc_date : "");
+        if (gps.have_local && gps.local_date[0]) snprintf(gps_local_date, sizeof(gps_local_date), "%s", gps.local_date);
+      }
+      if (gps.info.has_lat) snprintf(gps_lat, sizeof(gps_lat), "%.6f", gps.lat);
+      if (gps.info.has_lon) snprintf(gps_lon, sizeof(gps_lon), "%.6f", gps.lon);
+    }
+
     // Draw labels (first time) and diff-update values
     if (!(fields_mask & FLD_NONE)) {
       meter_update_values_dyn(&prev, &vlist, fields_mask, max_text_rows, start_chars,
                               busV, shuntV, curr_mA, power_W, percent,
-                              (const char(*)[24])vid_texts, (const char(*)[24])fmt_texts, vlist.count);
+                              (const char(*)[24])vid_texts, (const char(*)[24])fmt_texts, vlist.count,
+                              gps_utc_time, gps_utc_date,
+                              gps_local_time, gps_local_date,
+                              gps_lat, gps_lon,
+                              (tz_opt && *tz_opt) ? tz_opt : NULL);
     }
 
     // Battery icon update
@@ -1046,7 +1303,9 @@ static void run_power_meter_loop(int bus,
       if (flash_icon) {
         unsigned half_ms = (period_ms / 2u);
         if (half_ms < 50u) half_ms = 50u;
-        draw_battery_icon(last_page, icon_x, batt_width_px, (int)(percent + 0.5), 0);
+        if (!((int)(percent + 0.5) >= 99)) {
+          draw_battery_icon(last_page, icon_x, batt_width_px, (int)(percent + 0.5), 0);
+        }
         usleep(half_ms * 1000);
         draw_battery_icon_with_style(last_page, icon_x, batt_width_px, (int)(percent + 0.5), charging, icon_style);
         usleep(half_ms * 1000);
@@ -1073,8 +1332,15 @@ static void run_power_meter_loop(int bus,
     printf("Percent:       %3.1f%%\n", percent);
     printf("Video State:   %s\n", (agg_state == VID_PRESENT) ? "PRESENT" : ((agg_state == VID_ABSENT) ? "ABSENT" : "UNKNOWN"));
     if (agg_state == VID_PRESENT) printf("Detected fmt:  %s\n", agg_fmt_buf);
+    if (need_gps) {
+      if (gps_utc_date[0] || gps_utc_time[0]) printf("UTC:           %s %s\n", gps_utc_date, gps_utc_time);
+      if (gps_local_date[0] || gps_local_time[0]) printf("Local:         %s %s\n", gps_local_date, gps_local_time);
+      if (gps_lat[0] || gps_lon[0]) printf("Lat/Lon:       %s, %s\n", gps_lat, gps_lon);
+    }
     printf("\n");
   }
+
+  if (need_gps) gps_close(&gps);
   ina219_close(&meter);
 }
 
@@ -1084,8 +1350,9 @@ static void run_video_monitor_loop(int oled_cols,
                                    int oled_lines,
                                    const char* video_devs,
                                    unsigned video_poll_ms,
-                                   uint8_t fields_mask,
+                                   field_mask_t fields_mask,
                                    int vid_icon_x_offset) {
+  (void)fields_mask;
   ssd1306_oled_set_mem_mode(SSD1306_PAGE_MODE);
   uint8_t page_count = (uint8_t)(oled_lines / 8);
   if (page_count == 0) page_count = 1;
@@ -1093,13 +1360,13 @@ static void run_video_monitor_loop(int oled_cols,
 
   video_list_t vlist;
   build_video_list(video_devs, &vlist);
-
   vid_box_state_t vicons[MAX_VDEVS];
   memset(vicons, 0, sizeof(vicons));
 
   // Text rows available (reserve bottom page for icons)
   uint8_t max_text_rows = (last_page > 0) ? last_page : 0;
   const int start_chars = 6;
+  (void)start_chars;
 
   // draw static labels once: VID0:, FMT0:, VID1:, FMT1:, ...
   uint8_t label_row = 0;
@@ -1125,42 +1392,37 @@ static void run_video_monitor_loop(int oled_cols,
     for (int i = 0; i < vlist.count; ++i) {
       char fmt_local[96];
       video_state_t st = parse_video_status_for_dev(vlist.devs[i], fmt_local, sizeof(fmt_local));
-
       // Icons on bottom page, horizontally spaced
       int x_box = vid_icon_x_offset + i * (VICON_W + VICON_SP);
       if (x_box < oled_cols) {
         video_box_update(&vicons[i], last_page, x_box, st);
       }
-
       // per-device text
-      if (!(fields_mask & FLD_NONE)) {
-        const char* vid_text = (st == VID_PRESENT) ? "Cable detected" : ((st == VID_ABSENT) ? "Cable undetected" : "UNK");
-        snprintf(vid_texts[i], sizeof(vid_texts[i]), "%s", vid_text);
-        if (st == VID_PRESENT) {
-          snprintf(fmt_texts[i], sizeof(fmt_texts[i]), "%s", fmt_local);
-        } else {
-          fmt_texts[i][0] = '\0';
-        }
+      const char* vid_text = (st == VID_PRESENT) ? "Cable detected" : ((st == VID_ABSENT) ? "Cable undetected" : "UNK");
+      snprintf(vid_texts[i], sizeof(vid_texts[i]), "%s", vid_text);
+      if (st == VID_PRESENT) {
+        snprintf(fmt_texts[i], sizeof(fmt_texts[i]), "%s", fmt_local);
+      } else {
+        fmt_texts[i][0] = '\0';
       }
     }
 
     // write per-device values immediately after labels
     int row = 0;
-    for (int i = 0; i < vlist.count && row < max_text_rows; ++i) {
+    for (int i = 0; i < vlist.count && row < (int)max_text_rows; ++i) {
       // VIDn value
       int label_chars = (int)strlen("VID0:"); // 5
-      ssd1306_oled_clear_line(row);
+      ssd1306_oled_clear_line((uint8_t)row);
       ssd1306_oled_set_XY((uint8_t)(label_chars * meter_char_width()), (uint8_t)row);
       ssd1306_oled_write_line(METER_FONT_SIZE, vid_texts[i]);
       row++;
-      if (row >= max_text_rows) break;
+      if (row >= (int)max_text_rows) break;
       // FMTn value
-      ssd1306_oled_clear_line(row);
+      ssd1306_oled_clear_line((uint8_t)row);
       ssd1306_oled_set_XY((uint8_t)(label_chars * meter_char_width()), (uint8_t)row);
       ssd1306_oled_write_line(METER_FONT_SIZE, fmt_texts[i]);
       row++;
     }
-
     if (video_poll_ms < 100u) video_poll_ms = 100u;
     usleep(video_poll_ms * 1000);
   }
@@ -1213,26 +1475,33 @@ int main(int argc, char** argv) {
   int animate = 0;
   int test_frame = 0;
   unsigned frame_delay_ms = 30;
+
   int power_meter = 0;
   int ina_bus = 10;
   int ina_addr = 0x43;
   unsigned ina_period_ms = 2000;
-  char fields_arg[128] = {0};
-  uint8_t fields_mask = default_field_mask();
+
+  char fields_arg[256] = {0};
+  field_mask_t fields_mask = default_field_mask();
+
   int show_batt_icon = 0;
   int invert_charge = 0;
   int batt_x_offset = -1;    // centered by default
   int batt_width_px = 18;    // 14..24
   int flash_icon = 0;
   ChargeIconStyle icon_style = CHARGE_ICON_PLUG;
+
   int video_monitor = 0;
   char video_devs[256] = {0};
   unsigned video_poll_ms = 2000;
-  int vid_icon_x_offset = 0; // new: X-offset for video icons
-  int cmd_opt = 0;
+  int vid_icon_x_offset = 0; // X-offset for video icons
 
+  char nmea_arg[192] = {0};  // -p <dev[,baud[,timeout]]>
+  char tz_arg[64] = {0};     // -Z <TZ>
+
+  int cmd_opt = 0;
   while (cmd_opt != -1) {
-    cmd_opt = getopt(argc, argv, "I:c::d:f:hi:l:m:n:r:x:y:AS:T::PB:G:U:E:bk:w:zFC:HV:Q:j:");
+    cmd_opt = getopt(argc, argv, "I:c::d:f:hi:l:m:n:r:x:y:AS:T::PB:G:U:E:bk:w:zFC:HV:Q:j:p:Z:");
     switch (cmd_opt) {
       case 'I':
         snprintf(oled_type, sizeof(oled_type) - 1, "%s", optarg);
@@ -1343,6 +1612,14 @@ int main(int argc, char** argv) {
         vid_icon_x_offset = atoi(optarg);
         if (vid_icon_x_offset < 0) vid_icon_x_offset = 0;
         break;
+      case 'p':
+        strncpy(nmea_arg, optarg, sizeof(nmea_arg) - 1);
+        nmea_arg[sizeof(nmea_arg) - 1] = '\0';
+        break;
+      case 'Z':
+        strncpy(tz_arg, optarg, sizeof(tz_arg) - 1);
+        tz_arg[sizeof(tz_arg) - 1] = '\0';
+        break;
       case -1:
         break;
       case '?':
@@ -1377,7 +1654,7 @@ int main(int argc, char** argv) {
           printf("prams -%c missing ms value\n", optopt);
           return 1;
         } else if (optopt == 'E') {
-          printf("prams -%c missing fields list (e.g., psu,load,curr,power,pct,vid,fmt|none)\n", optopt);
+          printf("prams -%c missing fields list (e.g., psu,load,curr,power,pct,vid,fmt,utc_time,local_time,lat,lon|none)\n", optopt);
           return 1;
         } else if (optopt == 'k') {
           printf("prams -%c missing pixel offset\n", optopt);
@@ -1396,6 +1673,12 @@ int main(int argc, char** argv) {
           return 1;
         } else if (optopt == 'j') {
           printf("prams -%c missing pixel offset\n", optopt);
+          return 1;
+        } else if (optopt == 'p') {
+          printf("prams -%c missing NMEA spec: dev[,baud[,timeout]]\n", optopt);
+          return 1;
+        } else if (optopt == 'Z') {
+          printf("prams -%c missing TZ (e.g., America/Chicago or CST6CDT)\n", optopt);
           return 1;
         } else {
           print_help();
@@ -1452,9 +1735,11 @@ int main(int argc, char** argv) {
   if (orientation > -1) rc += ssd1306_oled_set_rotate((uint8_t)orientation);
   if (inverted > -1)    rc += ssd1306_oled_display_flip((uint8_t)inverted);
   if (display > -1)     rc += ssd1306_oled_onoff((uint8_t)display);
+
   if (x > -1 && y > -1)      rc += ssd1306_oled_set_XY((uint8_t)x, (uint8_t)y);
   else if (x > -1)           rc += ssd1306_oled_set_X((uint8_t)x);
   else if (y > -1)           rc += ssd1306_oled_set_Y((uint8_t)y);
+
   if (msg[0] != 0) rc += ssd1306_oled_write_string((uint8_t)font, msg);
   else if (line[0] != 0) rc += ssd1306_oled_write_line((uint8_t)font, line);
 
@@ -1476,7 +1761,7 @@ int main(int argc, char** argv) {
     ssd1306_blit_from_01(image_data, 128, 64);
   }
 
-  // Power meter (with optional video overlays)
+  // Power meter (with optional video overlays and GPS)
   if (power_meter) {
     ssd1306_oled_onoff(1);
     run_power_meter_loop(ina_bus, (uint8_t)ina_addr, ina_period_ms,
@@ -1485,7 +1770,8 @@ int main(int argc, char** argv) {
                          batt_x_offset, batt_width_px,
                          flash_icon, icon_style,
                          video_devs, video_poll_ms,
-                         vid_icon_x_offset);
+                         vid_icon_x_offset,
+                         nmea_arg, tz_arg);
   }
 
   // Video-only monitor

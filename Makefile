@@ -1,8 +1,8 @@
 CC=gcc
 #CFLAGS=-I ./ -Wall -Werror
 #CFLAGS=-I ./ -Werror
-CFLAGS=-I ./
-LDFLAGS=-static
+CFLAGS=-I ./ -DNMEA_MINI_ENABLE_TZ -O2
+LDFLAGS=-lm -lpopt -static
 OBJS=main.o ssd1306.o linux_i2c.o
 BIN=ssd1306_bin
 
