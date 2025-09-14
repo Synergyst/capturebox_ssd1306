@@ -9,4 +9,4 @@ cd /root/ssd1306_linux
 #/root/ssd1306_linux/ssd1306_bin -P -b -f 0 -E pct,curr -k 96 -w 20 -F -U 750
 #/root/ssd1306_linux/ssd1306_bin -P -b -f 0 -E none -k 0 -w 20 -F -U 750
 #/root/ssd1306_linux/ssd1306_bin -c && /root/ssd1306_linux/ssd1306_bin -P -b -f 0 -E vid,fmt -k 0 -w 20 -F -U 750 -V /dev/video0,/dev/video1 -Q 10000 -H -j 21
-/root/ssd1306_linux/ssd1306_bin -c && /root/ssd1306_linux/ssd1306_bin -P -b -f 0 -E vid,fmt -k 0 -w 20 -F -U 750 -V /dev/video0,/dev/video1 -Q 10000 -j 21
+/root/ssd1306_linux/ssd1306_bin -c && /root/ssd1306_linux/ssd1306_bin -P -b -f 0 -E vid,fmt -k 0 -w 20 -F -U 750 -V /dev/video0,/dev/video1 -Q 375 -j 22

@@ -800,12 +800,16 @@ static video_state_t parse_video_status_for_dev(const char* devnode, char* fmt_o
   while (fgets(line, sizeof(line), fp)) {
     if (strstr(line, "No video detected")) {
       st = VID_ABSENT;
+      memcpy(fmt_out, "No HDMI signal", 14);
+      fmt_out[14] = '\0';
+      //fprintf(stderr, "%s\n", fmt_out);
     }
     if (strstr(line, "Detected format:")) {
       st = VID_PRESENT;
       char* p = strstr(line, "Detected format:");
       p += strlen("Detected format:");
       while (*p == ' ' || *p == '\t') p++;
+      //size_t n = strcspn(p, "\r\n");
       size_t n = strcspn(p, " (");
       if (fmt_out && fmt_len) {
         if (n >= fmt_len) n = fmt_len - 1;
@@ -848,6 +852,10 @@ static video_state_t parse_video_status_multi(const char* list, char* fmt_out, s
       // keep scanning to update 'agg' but we already have one present
     } else if (st == VID_UNKNOWN && agg == VID_ABSENT) {
       agg = VID_UNKNOWN;
+      // We should print at least no-signal, this code is likely redundant long-term...
+      if (fmt_out && fmt_len && fmt_out[0] == '\0') {
+        snprintf(fmt_out, fmt_len, "%s", fmt_local);
+      }
     }
     tok = strtok(NULL, ",");
   }
@@ -993,15 +1001,21 @@ static void run_power_meter_loop(int bus,
         }
         // prepare per-device text values
         if (st == VID_PRESENT) {
-          snprintf(vid_texts[i], sizeof(vid_texts[i]), "OK");
+          snprintf(vid_texts[i], sizeof(vid_texts[i]), "Cable detected");
           snprintf(fmt_texts[i], sizeof(fmt_texts[i]), "%s", fmt_local);
           if (agg_state != VID_PRESENT) {
             agg_state = VID_PRESENT;
             snprintf(agg_fmt_buf, sizeof(agg_fmt_buf), "%s", fmt_local);
           }
         } else if (st == VID_ABSENT) {
-          snprintf(vid_texts[i], sizeof(vid_texts[i]), "NO");
-          fmt_texts[i][0] = '\0';
+          snprintf(vid_texts[i], sizeof(vid_texts[i]), "Cable undetected");
+          //fmt_texts[i][0] = '\0';
+          // We should print at least no-signal, this code is likely redundant long-term...
+          snprintf(fmt_texts[i], sizeof(fmt_texts[i]), "%s", fmt_local);
+          if (agg_state != VID_PRESENT) {
+            agg_state = VID_PRESENT;
+            snprintf(agg_fmt_buf, sizeof(agg_fmt_buf), "%s", fmt_local);
+          }
         } else {
           snprintf(vid_texts[i], sizeof(vid_texts[i]), "UNK");
           fmt_texts[i][0] = '\0';
@@ -1120,10 +1134,13 @@ static void run_video_monitor_loop(int oled_cols,
 
       // per-device text
       if (!(fields_mask & FLD_NONE)) {
-        const char* vid_text = (st == VID_PRESENT) ? "OK" : ((st == VID_ABSENT) ? "NO" : "UNK");
+        const char* vid_text = (st == VID_PRESENT) ? "Cable detected" : ((st == VID_ABSENT) ? "Cable undetected" : "UNK");
         snprintf(vid_texts[i], sizeof(vid_texts[i]), "%s", vid_text);
-        if (st == VID_PRESENT) snprintf(fmt_texts[i], sizeof(fmt_texts[i]), "%s", fmt_local);
-        else fmt_texts[i][0] = '\0';
+        if (st == VID_PRESENT) {
+          snprintf(fmt_texts[i], sizeof(fmt_texts[i]), "%s", fmt_local);
+        } else {
+          fmt_texts[i][0] = '\0';
+        }
       }
     }
 
