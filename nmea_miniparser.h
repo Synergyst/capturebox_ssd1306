@@ -1,10 +1,8 @@
 #ifndef NMEA_MINIPARSER_H
 #define NMEA_MINIPARSER_H
-
 #ifdef __cplusplus
 extern "C" {
 #endif
-
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
@@ -25,14 +23,31 @@ typedef struct {
     int hour, minute, second;   /* UTC time */
     int year, month, day;       /* UTC date (YYYY, 1..12, 1..31) */
     double lat, lon;            /* decimal degrees */
+
+    /* New fields */
+    int has_speed;
+    int has_course;
+    int has_alt;
+    int has_sats;
+    int has_hdop;
+    double speed_knots;         /* speed over ground in knots (RMC) */
+    double course_deg;          /* course over ground in degrees (RMC) */
+    double alt_m;               /* altitude in meters (GGA) */
+    int satellites;             /* satellites in use (GGA) */
+    double hdop;                /* horizontal dilution of precision (GGA) */
 } nmea_info_t;
 
 enum {
-    NMEA_UPDATED_NONE = 0,
-    NMEA_UPDATED_TIME = 1 << 0,
-    NMEA_UPDATED_DATE = 1 << 1,
-    NMEA_UPDATED_LAT  = 1 << 2,
-    NMEA_UPDATED_LON  = 1 << 3
+    NMEA_UPDATED_NONE  = 0,
+    NMEA_UPDATED_TIME  = 1 << 0,
+    NMEA_UPDATED_DATE  = 1 << 1,
+    NMEA_UPDATED_LAT   = 1 << 2,
+    NMEA_UPDATED_LON   = 1 << 3,
+    NMEA_UPDATED_SPEED = 1 << 4,
+    NMEA_UPDATED_COURSE= 1 << 5,
+    NMEA_UPDATED_ALT   = 1 << 6,
+    NMEA_UPDATED_SATS  = 1 << 7,
+    NMEA_UPDATED_HDOP  = 1 << 8
 };
 
 static inline void nmea_info_clear(nmea_info_t* info) {
@@ -114,40 +129,57 @@ static inline unsigned nmea_parse_rmc(char* s, nmea_info_t* info) {
     char* star = strchr(s, '*'); if (star) *star = '\0';
     char* f[24] = {0};
     int idx = nmea_split_fields(s, ",", f, 24);
-
     const char* times = (idx > 1) ? f[1] : NULL;
     const char* status= (idx > 2) ? f[2] : NULL;
     const char* lats  = (idx > 3) ? f[3] : NULL;
     const char* ns    = (idx > 4) ? f[4] : NULL;
     const char* lons  = (idx > 5) ? f[5] : NULL;
     const char* ew    = (idx > 6) ? f[6] : NULL;
+    const char* spdkn = (idx > 7) ? f[7] : NULL; /* speed over ground (knots) */
+    const char* crs   = (idx > 8) ? f[8] : NULL; /* course over ground (deg) */
     const char* dates = (idx > 9) ? f[9] : NULL;
 
-    if (!info->has_time && times && *times) {
+    /* Always update if present (do not make fields "sticky") */
+
+    if (times && *times) {
         int H,M,S;
         if (nmea_parse_hhmmss(times, &H, &M, &S)) {
             info->hour = H; info->minute = M; info->second = S; info->has_time = 1;
             updated |= NMEA_UPDATED_TIME;
         }
     }
-    if (!info->has_date && dates && *dates) {
+    if (dates && *dates) {
         int Y,M,D;
         if (nmea_parse_ddmmyy(dates, &Y, &M, &D)) {
             info->year = Y; info->month = M; info->day = D; info->has_date = 1;
             updated |= NMEA_UPDATED_DATE;
         }
     }
+
     int fix_ok = (status && *status == 'A');
     if (fix_ok) {
-        if (!info->has_lat && lats && ns && *lats && *ns) {
+        if (lats && ns && *lats && *ns) {
             double lat = nmea_degmin_to_decimal(lats, ns[0]);
             if (!isnan(lat)) { info->lat = lat; info->has_lat = 1; updated |= NMEA_UPDATED_LAT; }
         }
-        if (!info->has_lon && lons && ew && *lons && *ew) {
+        if (lons && ew && *lons && *ew) {
             double lon = nmea_degmin_to_decimal(lons, ew[0]);
             if (!isnan(lon)) { info->lon = lon; info->has_lon = 1; updated |= NMEA_UPDATED_LON; }
         }
     }
+
+    if (spdkn && *spdkn) {
+        info->speed_knots = atof(spdkn);
+        info->has_speed = 1;
+        updated |= NMEA_UPDATED_SPEED;
+    }
+
+    if (crs && *crs) {
+        info->course_deg = atof(crs);
+        info->has_course = 1;
+        updated |= NMEA_UPDATED_COURSE;
+    }
+
     return updated;
 }
 
@@ -156,32 +188,56 @@ static inline unsigned nmea_parse_gga(char* s, nmea_info_t* info) {
     char* star = strchr(s, '*'); if (star) *star = '\0';
     char* f[20] = {0};
     int idx = nmea_split_fields(s, ",", f, 20);
-
     const char* times = (idx > 1) ? f[1] : NULL;
     const char* lats  = (idx > 2) ? f[2] : NULL;
     const char* ns    = (idx > 3) ? f[3] : NULL;
     const char* lons  = (idx > 4) ? f[4] : NULL;
     const char* ew    = (idx > 5) ? f[5] : NULL;
     const char* fixq  = (idx > 6) ? f[6] : NULL;
+    const char* sats  = (idx > 7) ? f[7] : NULL;
+    const char* hdop  = (idx > 8) ? f[8] : NULL;
+    const char* alt   = (idx > 9) ? f[9] : NULL;
+    // f[10] unit 'M'
 
-    if (!info->has_time && times && *times) {
+    if (times && *times) {
         int H,M,S;
         if (nmea_parse_hhmmss(times, &H, &M, &S)) {
             info->hour = H; info->minute = M; info->second = S; info->has_time = 1;
             updated |= NMEA_UPDATED_TIME;
         }
     }
+
     int fix_ok = (fixq && *fixq != '0');
     if (fix_ok) {
-        if (!info->has_lat && lats && ns && *lats && *ns) {
+        if (lats && ns && *lats && *ns) {
             double lat = nmea_degmin_to_decimal(lats, ns[0]);
             if (!isnan(lat)) { info->lat = lat; info->has_lat = 1; updated |= NMEA_UPDATED_LAT; }
         }
-        if (!info->has_lon && lons && ew && *lons && *ew) {
+        if (lons && ew && *lons && *ew) {
             double lon = nmea_degmin_to_decimal(lons, ew[0]);
             if (!isnan(lon)) { info->lon = lon; info->has_lon = 1; updated |= NMEA_UPDATED_LON; }
         }
     }
+
+    if (sats && *sats) {
+        int nsats = atoi(sats);
+        info->satellites = nsats;
+        info->has_sats = 1;
+        updated |= NMEA_UPDATED_SATS;
+    }
+
+    if (hdop && *hdop) {
+        info->hdop = atof(hdop);
+        info->has_hdop = 1;
+        updated |= NMEA_UPDATED_HDOP;
+    }
+
+    if (alt && *alt) {
+        info->alt_m = atof(alt);
+        info->has_alt = 1;
+        updated |= NMEA_UPDATED_ALT;
+    }
+
     return updated;
 }
 
@@ -190,7 +246,6 @@ static inline unsigned nmea_parse_gll(char* s, nmea_info_t* info) {
     char* star = strchr(s, '*'); if (star) *star = '\0';
     char* f[16] = {0};
     int idx = nmea_split_fields(s, ",", f, 16);
-
     const char* lats  = (idx > 1) ? f[1] : NULL;
     const char* ns    = (idx > 2) ? f[2] : NULL;
     const char* lons  = (idx > 3) ? f[3] : NULL;
@@ -198,7 +253,7 @@ static inline unsigned nmea_parse_gll(char* s, nmea_info_t* info) {
     const char* times = (idx > 5) ? f[5] : NULL;
     const char* stat  = (idx > 6) ? f[6] : NULL;
 
-    if (!info->has_time && times && *times) {
+    if (times && *times) {
         int H,M,S;
         if (nmea_parse_hhmmss(times, &H, &M, &S)) {
             info->hour = H; info->minute = M; info->second = S; info->has_time = 1;
@@ -207,11 +262,11 @@ static inline unsigned nmea_parse_gll(char* s, nmea_info_t* info) {
     }
     int fix_ok = (stat && *stat == 'A');
     if (fix_ok) {
-        if (!info->has_lat && lats && ns && *lats && *ns) {
+        if (lats && ns && *lats && *ns) {
             double lat = nmea_degmin_to_decimal(lats, ns[0]);
             if (!isnan(lat)) { info->lat = lat; info->has_lat = 1; updated |= NMEA_UPDATED_LAT; }
         }
-        if (!info->has_lon && lons && ew && *lons && *ew) {
+        if (lons && ew && *lons && *ew) {
             double lon = nmea_degmin_to_decimal(lons, ew[0]);
             if (!isnan(lon)) { info->lon = lon; info->has_lon = 1; updated |= NMEA_UPDATED_LON; }
         }
@@ -224,20 +279,19 @@ static inline unsigned nmea_parse_zda(char* s, nmea_info_t* info) {
     char* star = strchr(s, '*'); if (star) *star = '\0';
     char* f[12] = {0};
     int idx = nmea_split_fields(s, ",", f, 12);
-
     const char* times = (idx > 1) ? f[1] : NULL;
     const char* day   = (idx > 2) ? f[2] : NULL;
     const char* mon   = (idx > 3) ? f[3] : NULL;
     const char* year  = (idx > 4) ? f[4] : NULL;
 
-    if (!info->has_time && times && *times) {
+    if (times && *times) {
         int H,M,S;
         if (nmea_parse_hhmmss(times, &H, &M, &S)) {
             info->hour = H; info->minute = M; info->second = S; info->has_time = 1;
             updated |= NMEA_UPDATED_TIME;
         }
     }
-    if (!info->has_date && day && mon && year && *day && *mon && *year) {
+    if (day && mon && year && *day && *mon && *year) {
         int D = atoi(day), M = atoi(mon), Y = atoi(year);
         if (Y >= 1900 && M >= 1 && M <= 12 && D >= 1 && D <= 31) {
             info->year = Y; info->month = M; info->day = D; info->has_date = 1;
@@ -250,20 +304,17 @@ static inline unsigned nmea_parse_zda(char* s, nmea_info_t* info) {
 /* Parse one full NMEA line (CR/LF allowed). Returns bitmask of updates. */
 static inline unsigned nmea_parse_line(const char* line, nmea_info_t* info) {
     if (!line || !info) return NMEA_UPDATED_NONE;
-
     char buf[NMEA_MAX_LINE];
     size_t n = 0;
     for (; n + 1 < sizeof(buf) && line[n]; ++n) buf[n] = line[n];
     if (n >= sizeof(buf)) n = sizeof(buf) - 1;
     buf[n] = '\0';
     while (n > 0 && (buf[n-1] == '\r' || buf[n-1] == '\n')) buf[--n] = '\0';
-
     if (n < 1 || buf[0] != '$') return NMEA_UPDATED_NONE;
     if (!nmea_checksum_ok_allow_missing(buf)) return NMEA_UPDATED_NONE;
 
     unsigned updated = 0;
     char work[NMEA_MAX_LINE];
-
     if (nmea_starts_with_talker(buf, "RMC")) {
         strncpy(work, buf, sizeof(work)-1); work[sizeof(work)-1] = '\0';
         updated |= nmea_parse_rmc(work, info);
@@ -321,8 +372,7 @@ static inline int nmea_format_utc(const nmea_info_t* info,
 
 /* Optional: local formatting (requires TZ names, uses env). Disabled by default. */
 #ifdef NMEA_MINI_ENABLE_TZ
-
-/* Provide portable wrappers for *gmtime_r/localtime_r */
+/* Provide portable wrappers for gmtime_r/localtime_r */
 static inline struct tm* nmea_gmtime_r(const time_t* t, struct tm* out) {
 #if defined(_POSIX_C_SOURCE) && _POSIX_C_SOURCE >= 200112L
     return gmtime_r(t, out);
@@ -333,6 +383,7 @@ static inline struct tm* nmea_gmtime_r(const time_t* t, struct tm* out) {
     return out;
 #endif
 }
+
 static inline struct tm* nmea_localtime_r(const time_t* t, struct tm* out) {
 #if defined(_POSIX_C_SOURCE) && _POSIX_C_SOURCE >= 200112L
     return localtime_r(t, out);
@@ -384,7 +435,6 @@ static inline int nmea_format_local_from_info(const nmea_info_t* info,
 
     if (had_old) setenv("TZ", oldbuf, 1); else unsetenv("TZ");
     tzset();
-
     return ok;
 }
 #endif /* NMEA_MINI_ENABLE_TZ */
@@ -422,5 +472,4 @@ static inline void nmea_acc_feed(nmea_acc_t* acc, const char* data, size_t n,
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
-
 #endif /* NMEA_MINIPARSER_H */

@@ -2,22 +2,20 @@
 // SSD1306 OLED utility with power meter, video monitor, and GPS/NMEA time/lat/lon fields.
 //
 // New features:
-// -E list adds: utc_time, utc_date, local_time, local_date, lat, lon
-// -p dev[,baud[,timeout]]: NMEA serial (default /dev/ttyS0,115200,10)
+// -E list adds: utc_time, utc_date, local_time, local_date, lat, lon, speed, alt, sats, course, hdop
+// -p dev[,baud[,timeout]]: NMEA serial (default /dev/ttyS0,115200,1)
 // -Z TZ: timezone for local time (IANA or POSIX, e.g., CST6CDT) requires -DNMEA_MINI_ENABLE_TZ
 //
 // Build (UTC-only):
 //   gcc -std=c11 -O2 -Wall -Wextra -o ssd1306_bin ssd1306_bin.c nmea_miniparser.c -lm
 // Build (with local time formatting helpers in header):
 //   gcc -std=c11 -O2 -Wall -Wextra -DNMEA_MINI_ENABLE_TZ -o ssd1306_bin ssd1306_bin.c nmea_miniparser.c -lm
-
 #include <linux/i2c-dev.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <inttypes.h>
 #include <unistd.h>
 #include <stdio.h>
-#include <unistd.h>
 #include <string.h>
 #include <strings.h>
 #include <fcntl.h>
@@ -27,9 +25,6 @@
 #include <termios.h>
 #include <sys/select.h>
 #include <sys/time.h>
-#include <time.h>
-#include <popt.h>
-
 #include "ssd1306.h"
 #include "linux_i2c.h"
 #include "image.h"
@@ -71,7 +66,7 @@ static void print_help() {
   printf("-B <bus>   INA219 I2C bus number (default 10)\n");
   printf("-G <addr>  INA219 I2C address (hex 0x43 or decimal, default 0x43)\n");
   printf("-U <ms>    INA219 sample/update period in ms (default 2000 ms)\n");
-  printf("-E <list>  enable fields: comma list of psu,load,curr,power,pct,vid,fmt,utc_time,utc_date,local_time,local_date,lat,lon or 'none' (default all)\n");
+  printf("-E <list>  enable fields: comma list of psu,load,curr,power,pct,vid,fmt,utc_time,utc_date,local_time,local_date,lat,lon,speed,alt,sats,course,hdop or 'none' (default all)\n");
   printf("-b         show battery icon on bottom row (independent of -E)\n");
   printf("-C <name>  charge icon style: plug|plus|check|bolt_h (default plug)\n");
   printf("-F         flash between fill-only and icon overlay (half period each)\n");
@@ -82,7 +77,7 @@ static void print_help() {
   printf("-V <list>  video devices to check (comma list), default /dev/video0\n");
   printf("-Q <ms>    video poll interval (default 2000 ms)\n");
   printf("-j <px>    video icon X offset in pixels (default 0)\n");
-  printf("-p <spec>  NMEA serial spec: dev[,baud[,timeout]] (default /dev/ttyS0,115200,10)\n");
+  printf("-p <spec>  NMEA serial spec: dev[,baud[,timeout]] (default /dev/ttyS0,115200,1)\n");
   printf("-Z <TZ>    Timezone for local time (IANA or POSIX, needs -DNMEA_MINI_ENABLE_TZ)\n");
   printf("-h         this help\n");
 }
@@ -379,6 +374,7 @@ static void meter_diff_and_draw(uint8_t row_page, int x_chars, char* prev, const
 
 // Field mask bits (now 32-bit to allow new GPS/time fields)
 typedef uint32_t field_mask_t;
+
 #define FLD_PSU        (1u << 0)
 #define FLD_LOAD       (1u << 1)
 #define FLD_CURR       (1u << 2)
@@ -387,13 +383,19 @@ typedef uint32_t field_mask_t;
 #define FLD_NONE       (1u << 5)
 #define FLD_VID        (1u << 6)
 #define FLD_FMT        (1u << 7)
-// New GPS/time fields
+// GPS/time fields
 #define FLD_UTC_TIME   (1u << 8)
 #define FLD_UTC_DATE   (1u << 9)
 #define FLD_LOCAL_TIME (1u << 10)
 #define FLD_LOCAL_DATE (1u << 11)
 #define FLD_LAT        (1u << 12)
 #define FLD_LON        (1u << 13)
+// New GPS data fields
+#define FLD_SPEED      (1u << 14)
+#define FLD_ALT        (1u << 15)
+#define FLD_SATS       (1u << 16)
+#define FLD_COURSE     (1u << 17)
+#define FLD_HDOP       (1u << 18)
 
 static inline field_mask_t default_field_mask(void) {
   return (FLD_PSU | FLD_LOAD | FLD_CURR | FLD_POWER | FLD_PCT | FLD_VID | FLD_FMT);
@@ -423,6 +425,11 @@ static field_mask_t parse_enabled_fields(const char* s) {
     else if (!strcasecmp(tok, "local_date") || !strcasecmp(tok, "date")) mask |= FLD_LOCAL_DATE;
     else if (!strcasecmp(tok, "lat"))                                     mask |= FLD_LAT;
     else if (!strcasecmp(tok, "lon"))                                     mask |= FLD_LON;
+    else if (!strcasecmp(tok, "speed"))                                   mask |= FLD_SPEED;
+    else if (!strcasecmp(tok, "alt"))                                     mask |= FLD_ALT;
+    else if (!strcasecmp(tok, "sats") || !strcasecmp(tok, "satellites"))  mask |= FLD_SATS;
+    else if (!strcasecmp(tok, "course"))                                  mask |= FLD_COURSE;
+    else if (!strcasecmp(tok, "hdop"))                                    mask |= FLD_HDOP;
     tok = strtok(NULL, ",");
   }
   if (saw_none) return FLD_NONE;
@@ -480,25 +487,35 @@ static void meter_draw_static_labels_dyn_for_vlist(const video_list_t* vlist,
     const char* lab_pct   = "BATT(%):";
     const char* lab_utc   = "UTC:";
     char lab_local[16]; lab_local[0] = 0;
-
     if (tz_label_opt && *tz_label_opt) {
       snprintf(lab_local, sizeof(lab_local), "%.12s:", tz_label_opt);
     } else {
       snprintf(lab_local, sizeof(lab_local), "LOCAL:");
     }
+    const char* lab_speed = "SPD(kn):";
+    const char* lab_alt   = "ALT(m):";
+    const char* lab_sats  = "SATS:";
+    const char* lab_course= "CRS(deg):";
+    const char* lab_hdop  = "HDOP:";
 
     uint8_t row = 0;
     if ((enabled_mask & FLD_PSU)        && row < max_rows) { ssd1306_oled_set_XY(0, row); ssd1306_oled_write_line(METER_FONT_SIZE, (char*)lab_psu);   row++; }
     if ((enabled_mask & FLD_LOAD)       && row < max_rows) { ssd1306_oled_set_XY(0, row); ssd1306_oled_write_line(METER_FONT_SIZE, (char*)lab_load);  row++; }
     if ((enabled_mask & FLD_CURR)       && row < max_rows) { ssd1306_oled_set_XY(0, row); ssd1306_oled_write_line(METER_FONT_SIZE, (char*)lab_curr);  row++; }
     if ((enabled_mask & FLD_POWER)      && row < max_rows) { ssd1306_oled_set_XY(0, row); ssd1306_oled_write_line(METER_FONT_SIZE, (char*)lab_power); row++; }
-
     if ((enabled_mask & FLD_UTC_TIME)   && row < max_rows) { ssd1306_oled_set_XY(0, row); ssd1306_oled_write_line(METER_FONT_SIZE, (char*)lab_utc);   row++; }
     if ((enabled_mask & FLD_LOCAL_TIME) && row < max_rows) { ssd1306_oled_set_XY(0, row); ssd1306_oled_write_line(METER_FONT_SIZE, (lab_local[0]?lab_local:(char*)"LOCAL:")); row++; }
     if ((enabled_mask & FLD_UTC_DATE)   && row < max_rows) { ssd1306_oled_set_XY(0, row); ssd1306_oled_write_line(METER_FONT_SIZE, (char*)"UDATE:");  row++; }
     if ((enabled_mask & FLD_LOCAL_DATE) && row < max_rows) { ssd1306_oled_set_XY(0, row); ssd1306_oled_write_line(METER_FONT_SIZE, (char*)"LDATE:");  row++; }
     if ((enabled_mask & FLD_LAT)        && row < max_rows) { ssd1306_oled_set_XY(0, row); ssd1306_oled_write_line(METER_FONT_SIZE, (char*)"LAT:");    row++; }
     if ((enabled_mask & FLD_LON)        && row < max_rows) { ssd1306_oled_set_XY(0, row); ssd1306_oled_write_line(METER_FONT_SIZE, (char*)"LON:");    row++; }
+
+    // New GPS data labels
+    if ((enabled_mask & FLD_SPEED)      && row < max_rows) { ssd1306_oled_set_XY(0, row); ssd1306_oled_write_line(METER_FONT_SIZE, (char*)lab_speed); row++; }
+    if ((enabled_mask & FLD_ALT)        && row < max_rows) { ssd1306_oled_set_XY(0, row); ssd1306_oled_write_line(METER_FONT_SIZE, (char*)lab_alt);   row++; }
+    if ((enabled_mask & FLD_SATS)       && row < max_rows) { ssd1306_oled_set_XY(0, row); ssd1306_oled_write_line(METER_FONT_SIZE, (char*)lab_sats);  row++; }
+    if ((enabled_mask & FLD_COURSE)     && row < max_rows) { ssd1306_oled_set_XY(0, row); ssd1306_oled_write_line(METER_FONT_SIZE, (char*)lab_course);row++; }
+    if ((enabled_mask & FLD_HDOP)       && row < max_rows) { ssd1306_oled_set_XY(0, row); ssd1306_oled_write_line(METER_FONT_SIZE, (char*)lab_hdop);  row++; }
 
     if (vlist && vlist->count > 1) {
       for (int i = 0; i < vlist->count && row < max_rows; ++i) {
@@ -530,7 +547,6 @@ typedef struct {
   // keep single vid/fmt for single-device mode only
   char vid[24];
   char fmt[24];
-
   // GPS/time
   char utc_time[24];
   char utc_date[24];
@@ -538,7 +554,12 @@ typedef struct {
   char local_date[24];
   char lat[24];
   char lon[24];
-
+  // New GPS data
+  char speed[24];
+  char alt[24];
+  char sats[24];
+  char course[24];
+  char hdop[24];
   int  initialized;
 } meter_prev_t;
 
@@ -560,6 +581,11 @@ static uint8_t meter_update_values_dyn(meter_prev_t* st,
                                        const char* local_date,
                                        const char* lat_str,
                                        const char* lon_str,
+                                       const char* speed_kn_str,
+                                       const char* alt_m_str,
+                                       const char* sats_str,
+                                       const char* course_deg_str,
+                                       const char* hdop_str,
                                        const char* tz_label_opt) {
   if (!st) return 0;
   char now_psu[24], now_load[24], now_curr[24], now_power[24], now_pct[24];
@@ -572,14 +598,18 @@ static uint8_t meter_update_values_dyn(meter_prev_t* st,
   else                 snprintf(now_pct, sizeof(now_pct), "%3.2f", percent);
   snprintf(now_vid,   sizeof(now_vid),   "%s", (vid_count > 0 && vid_texts) ? vid_texts[0] : "");
   snprintf(now_fmt,   sizeof(now_fmt),   "%s", (vid_count > 0 && fmt_texts) ? fmt_texts[0] : "");
+
   if (!st->initialized) {
     meter_draw_static_labels_dyn_for_vlist(vlist, enabled_mask, max_rows, tz_label_opt);
     st->psu[0] = st->load[0] = st->curr[0] = st->power[0] = st->pct[0] = st->vid[0] = st->fmt[0] = '\0';
     st->utc_time[0] = st->utc_date[0] = st->local_time[0] = st->local_date[0] = st->lat[0] = st->lon[0] = '\0';
+    st->speed[0] = st->alt[0] = st->sats[0] = st->course[0] = st->hdop[0] = '\0';
     st->initialized = 1;
   }
+
   const int vid_label_chars_single = (int)strlen("VID:"); // 4
   const int fmt_label_chars_single = (int)strlen("FMT:"); // 4
+
   uint8_t row = 0;
   if ((enabled_mask & FLD_PSU)        && row < max_rows) { meter_diff_and_draw(row, start_chars, st->psu,       now_psu);   row++; }
   if ((enabled_mask & FLD_LOAD)       && row < max_rows) { meter_diff_and_draw(row, start_chars, st->load,      now_load);  row++; }
@@ -592,6 +622,14 @@ static uint8_t meter_update_values_dyn(meter_prev_t* st,
   if ((enabled_mask & FLD_LOCAL_DATE) && row < max_rows) { meter_diff_and_draw(row, start_chars, st->local_date, local_date ? local_date : ""); row++; }
   if ((enabled_mask & FLD_LAT)        && row < max_rows) { meter_diff_and_draw(row, start_chars, st->lat,       lat_str ? lat_str : "");       row++; }
   if ((enabled_mask & FLD_LON)        && row < max_rows) { meter_diff_and_draw(row, start_chars, st->lon,       lon_str ? lon_str : "");       row++; }
+
+  // New GPS numeric fields
+  if ((enabled_mask & FLD_SPEED)      && row < max_rows) { meter_diff_and_draw(row, start_chars, st->speed,  speed_kn_str  ? speed_kn_str  : ""); row++; }
+  if ((enabled_mask & FLD_ALT)        && row < max_rows) { meter_diff_and_draw(row, start_chars, st->alt,    alt_m_str     ? alt_m_str     : ""); row++; }
+  if ((enabled_mask & FLD_SATS)       && row < max_rows) { meter_diff_and_draw(row, start_chars, st->sats,   sats_str      ? sats_str      : ""); row++; }
+  if ((enabled_mask & FLD_COURSE)     && row < max_rows) { meter_diff_and_draw(row, start_chars, st->course, course_deg_str? course_deg_str: ""); row++; }
+  if ((enabled_mask & FLD_HDOP)       && row < max_rows) { meter_diff_and_draw(row, start_chars, st->hdop,   hdop_str      ? hdop_str      : ""); row++; }
+
   // For VID/FMT:
   if (vlist && vlist->count > 1) {
     // Multi-device: expand VIDn/FMTn pairs into rows
@@ -997,6 +1035,12 @@ typedef struct {
   double lat;
   double lon;
   int has_any;
+  // new formatted numeric strings
+  char speed_kn[24];
+  char alt_m[24];
+  char sats[24];
+  char course_deg[24];
+  char hdop[24];
 } gps_state_t;
 
 static speed_t gps_baud_to_speed_t(unsigned long baud) {
@@ -1113,6 +1157,8 @@ static void gps_format_outputs(gps_state_t* gps, const char* tz_opt) {
   gps->utc_date[0] = gps->utc_time[0] = 0;
   gps->local_date[0] = gps->local_time[0] = gps->local_dt[0] = 0;
   gps->have_local = 0;
+  gps->speed_kn[0] = gps->alt_m[0] = gps->sats[0] = gps->course_deg[0] = gps->hdop[0] = 0;
+
   if (gps->info.has_time || gps->info.has_date) {
     nmea_format_utc(&gps->info, gps->utc_date, sizeof gps->utc_date, gps->utc_time, sizeof gps->utc_time);
 #if defined(NMEA_MINI_ENABLE_TZ)
@@ -1128,7 +1174,18 @@ static void gps_format_outputs(gps_state_t* gps, const char* tz_opt) {
   }
   if (gps->info.has_lat) gps->lat = gps->info.lat;
   if (gps->info.has_lon) gps->lon = gps->info.lon;
-  if (gps->info.has_time || gps->info.has_date || gps->info.has_lat || gps->info.has_lon) gps->has_any = 1;
+
+  // new numeric fields
+  if (gps->info.has_speed)  snprintf(gps->speed_kn,   sizeof(gps->speed_kn),   "%.1f", gps->info.speed_knots);
+  if (gps->info.has_alt)    snprintf(gps->alt_m,      sizeof(gps->alt_m),      "%.1f", gps->info.alt_m);
+  if (gps->info.has_sats)   snprintf(gps->sats,       sizeof(gps->sats),       "%d",   gps->info.satellites);
+  if (gps->info.has_course) snprintf(gps->course_deg, sizeof(gps->course_deg), "%.1f", gps->info.course_deg);
+  if (gps->info.has_hdop)   snprintf(gps->hdop,       sizeof(gps->hdop),       "%.1f", gps->info.hdop);
+
+  if (gps->info.has_time || gps->info.has_date || gps->info.has_lat || gps->info.has_lon ||
+      gps->info.has_speed || gps->info.has_alt || gps->info.has_sats || gps->info.has_course || gps->info.has_hdop) {
+    gps->has_any = 1;
+  }
 }
 
 // ---------------- Power meter loop with video overlays and GPS ----------------
@@ -1161,9 +1218,10 @@ static void run_power_meter_loop(int bus,
   }
 
   // GPS/NMEA
-  int need_gps = (fields_mask & (FLD_UTC_TIME | FLD_UTC_DATE | FLD_LOCAL_TIME | FLD_LOCAL_DATE | FLD_LAT | FLD_LON)) ? 1 : 0;
+  int need_gps = (fields_mask & (FLD_UTC_TIME | FLD_UTC_DATE | FLD_LOCAL_TIME | FLD_LOCAL_DATE | FLD_LAT | FLD_LON |
+                                 FLD_SPEED | FLD_ALT | FLD_SATS | FLD_COURSE | FLD_HDOP)) ? 1 : 0;
   gps_state_t gps; memset(&gps, 0, sizeof(gps));
-  char nmea_dev[128] = "/dev/ttyS0"; int nmea_baud = 115200; int nmea_timeout = 10;
+  char nmea_dev[128] = "/dev/ttyS0"; int nmea_baud = 115200; int nmea_timeout = 1;
   if (need_gps) {
     if (nmea_spec && *nmea_spec) {
       // parse "dev[,baud[,timeout]]"
@@ -1180,15 +1238,18 @@ static void run_power_meter_loop(int bus,
   }
 
   ssd1306_oled_set_mem_mode(SSD1306_PAGE_MODE);
+
   meter_prev_t prev = {0};
   batt_state_t bstate_fill = {0};
   batt_state_style_t bstate_icon = {0};
+
   uint8_t page_count = (uint8_t)(oled_lines / 8);
   if (page_count == 0) page_count = 1;
   uint8_t last_page = (uint8_t)(page_count - 1);
   uint8_t max_text_rows = show_batt_icon ? last_page : page_count;
 
   const int start_chars = 8;
+
   int icon_x = batt_x_offset;
   if (icon_x < 0) {
     icon_x = (oled_cols - batt_width_px) / 2;
@@ -1221,7 +1282,6 @@ static void run_power_meter_loop(int bus,
       do_video_poll = 1;
       last_video_poll_ms = now_ms;
     }
-
     static char agg_fmt_buf[64];
     static video_state_t agg_state = VID_UNKNOWN;
     if (do_video_poll) {
@@ -1263,6 +1323,7 @@ static void run_power_meter_loop(int bus,
     double shuntV  = ina219_get_shunt_voltage_V(&meter);
     double curr_mA = ina219_get_current_mA(&meter);
     double power_W = ina219_get_power_W(&meter);
+
     double percent = (busV - 3.0) / 1.2 * 100.0;
     if (percent > 100.0) percent = 100.0;
     if (percent < 0.0)   percent = 0.0;
@@ -1271,9 +1332,14 @@ static void run_power_meter_loop(int bus,
     char gps_utc_time[24] = ""; char gps_utc_date[24] = "";
     char gps_local_time[24] = ""; char gps_local_date[24] = "";
     char gps_lat[24] = ""; char gps_lon[24] = "";
+    char gps_speed_kn[24] = ""; char gps_alt_m[24] = "";
+    char gps_sats[24] = ""; char gps_course_deg[24] = "";
+    char gps_hdop[24] = "";
+
     if (need_gps && gps.initialized) {
       gps_poll(&gps, 150, 0);
       gps_format_outputs(&gps, (tz_opt && *tz_opt) ? tz_opt : NULL);
+
       if (gps.info.has_time) {
         snprintf(gps_utc_time, sizeof(gps_utc_time), "%s", gps.utc_time[0] ? gps.utc_time : "");
         if (gps.have_local && gps.local_time[0]) snprintf(gps_local_time, sizeof(gps_local_time), "%s", gps.local_time);
@@ -1284,6 +1350,12 @@ static void run_power_meter_loop(int bus,
       }
       if (gps.info.has_lat) snprintf(gps_lat, sizeof(gps_lat), "%.6f", gps.lat);
       if (gps.info.has_lon) snprintf(gps_lon, sizeof(gps_lon), "%.6f", gps.lon);
+
+      if (gps.speed_kn[0])   snprintf(gps_speed_kn,   sizeof(gps_speed_kn),   "%s", gps.speed_kn);
+      if (gps.alt_m[0])      snprintf(gps_alt_m,      sizeof(gps_alt_m),      "%s", gps.alt_m);
+      if (gps.sats[0])       snprintf(gps_sats,       sizeof(gps_sats),       "%s", gps.sats);
+      if (gps.course_deg[0]) snprintf(gps_course_deg, sizeof(gps_course_deg), "%s", gps.course_deg);
+      if (gps.hdop[0])       snprintf(gps_hdop,       sizeof(gps_hdop),       "%s", gps.hdop);
     }
 
     // Draw labels (first time) and diff-update values
@@ -1294,6 +1366,7 @@ static void run_power_meter_loop(int bus,
                               gps_utc_time, gps_utc_date,
                               gps_local_time, gps_local_date,
                               gps_lat, gps_lon,
+                              gps_speed_kn, gps_alt_m, gps_sats, gps_course_deg, gps_hdop,
                               (tz_opt && *tz_opt) ? tz_opt : NULL);
     }
 
@@ -1336,6 +1409,11 @@ static void run_power_meter_loop(int bus,
       if (gps_utc_date[0] || gps_utc_time[0]) printf("UTC:           %s %s\n", gps_utc_date, gps_utc_time);
       if (gps_local_date[0] || gps_local_time[0]) printf("Local:         %s %s\n", gps_local_date, gps_local_time);
       if (gps_lat[0] || gps_lon[0]) printf("Lat/Lon:       %s, %s\n", gps_lat, gps_lon);
+      if (gps_speed_kn[0])   printf("Speed (kn):    %s\n", gps_speed_kn);
+      if (gps_alt_m[0])      printf("Altitude (m):  %s\n", gps_alt_m);
+      if (gps_sats[0])       printf("Satellites:    %s\n", gps_sats);
+      if (gps_course_deg[0]) printf("Course (deg):  %s\n", gps_course_deg);
+      if (gps_hdop[0])       printf("HDOP:          %s\n", gps_hdop);
     }
     printf("\n");
   }
@@ -1423,6 +1501,7 @@ static void run_video_monitor_loop(int oled_cols,
       ssd1306_oled_write_line(METER_FONT_SIZE, fmt_texts[i]);
       row++;
     }
+
     if (video_poll_ms < 100u) video_poll_ms = 100u;
     usleep(video_poll_ms * 1000);
   }
@@ -1475,27 +1554,22 @@ int main(int argc, char** argv) {
   int animate = 0;
   int test_frame = 0;
   unsigned frame_delay_ms = 30;
-
   int power_meter = 0;
   int ina_bus = 10;
   int ina_addr = 0x43;
   unsigned ina_period_ms = 2000;
-
   char fields_arg[256] = {0};
   field_mask_t fields_mask = default_field_mask();
-
   int show_batt_icon = 0;
   int invert_charge = 0;
   int batt_x_offset = -1;    // centered by default
   int batt_width_px = 18;    // 14..24
   int flash_icon = 0;
   ChargeIconStyle icon_style = CHARGE_ICON_PLUG;
-
   int video_monitor = 0;
   char video_devs[256] = {0};
   unsigned video_poll_ms = 2000;
   int vid_icon_x_offset = 0; // X-offset for video icons
-
   char nmea_arg[192] = {0};  // -p <dev[,baud[,timeout]]>
   char tz_arg[64] = {0};     // -Z <TZ>
 
@@ -1654,7 +1728,7 @@ int main(int argc, char** argv) {
           printf("prams -%c missing ms value\n", optopt);
           return 1;
         } else if (optopt == 'E') {
-          printf("prams -%c missing fields list (e.g., psu,load,curr,power,pct,vid,fmt,utc_time,local_time,lat,lon|none)\n", optopt);
+          printf("prams -%c missing fields list (e.g., psu,load,curr,power,pct,vid,fmt,utc_time,local_time,lat,lon,speed,alt,sats,course,hdop|none)\n", optopt);
           return 1;
         } else if (optopt == 'k') {
           printf("prams -%c missing pixel offset\n", optopt);

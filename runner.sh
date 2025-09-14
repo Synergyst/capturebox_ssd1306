@@ -14,4 +14,5 @@ make -j6
 #/root/ssd1306_linux/ssd1306_bin -c && /root/ssd1306_linux/ssd1306_bin -P -b -f 0 -E vid,fmt -k 0 -w 20 -F -U 750 -V /dev/video0 -Q 375 -j 22
 #/root/ssd1306_linux/ssd1306_bin -c && /root/ssd1306_linux/ssd1306_bin -P -b -f 0 -E psu,curr,pct -k 0 -w 20 -F -U 750
 #/root/ssd1306_linux/ssd1306_bin -c && /root/ssd1306_linux/ssd1306_bin -P -b -f 0 -E local_time,local_date,lat,lon -k 0 -w 20 -F -U 750
-/root/ssd1306_linux/ssd1306_bin -c && /root/ssd1306_linux/ssd1306_bin -P -b -f 0 -E utc_time,utc_date,lat,lon -k 0 -w 20 -F -U 750
+# psu,load,curr,power,pct,vid,fmt,utc_time,utc_date,local_time,local_date,lat,lon,speed,alt,sats,course,hdop
+/root/ssd1306_linux/ssd1306_bin -c && /root/ssd1306_linux/ssd1306_bin -P -b -f 0 -E local_time,local_date,lat,lon,alt,sats -k 0 -w 20 -F -U 750 -p /dev/ttyS0,115200,2 -Z CST6CDT
